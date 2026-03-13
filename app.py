@@ -6,373 +6,242 @@ from pathlib import Path
 import streamlit as st
 import streamlit.components.v1 as components
 
-from project_store import (
-    ProjectMetadata,
-    ensure_data_layout,
-    list_projects,
-    load_state,
-    make_project_id,
-    project_paths,
-    save_metadata,
-    save_results,
-    save_state,
-)
-from utils import (
-    ImportErrorUserFriendly,
-    append_logs,
-    build_listing_index,
-    extract_uploaded_zip,
-    listing_table_rows,
-)
+from storage import load_session, save_results_csv, save_session
+from utils import build_listing_index, ensure_directories, extract_uploaded_zip
 
 BASE_DIR = Path(__file__).resolve().parent
-PROJECTS_DIR = ensure_data_layout(BASE_DIR)
+DIRS = ensure_directories(BASE_DIR)
+SESSION_PATH = DIRS["data"] / "session_state.json"
+RESULTS_CSV_PATH = DIRS["data"] / "results.csv"
+LOG_PATH = DIRS["logs"] / "skipped.log"
 
 
-st.set_page_config(page_title="Разметка недвижимости", page_icon="🏡", layout="wide")
+st.set_page_config(page_title="Разметка объявлений", page_icon="🏡", layout="wide")
 
 st.markdown(
     """
     <style>
-    .card {border:1px solid rgba(120,120,120,.25); border-radius:14px; padding:14px; margin-bottom:10px;}
-    .muted {color:#8b96a8;}
-    .tag {display:inline-block; padding:3px 8px; border-radius:999px; border:1px solid rgba(120,120,120,.35); margin-right:6px;}
+    .header-card {
+        border-radius: 14px;
+        padding: 1rem 1.25rem;
+        background: linear-gradient(135deg, rgba(57,100,255,0.14), rgba(80,196,255,0.10));
+        border: 1px solid rgba(80,196,255,0.3);
+        margin-bottom: 1rem;
+    }
+    .photo-meta {
+        font-size: 1.1rem;
+        font-weight: 600;
+        margin-bottom: .2rem;
+    }
+    .muted { color: #8b96a8; font-size: .9rem; }
+    .stat-card {
+        border: 1px solid rgba(110, 118, 129, 0.2);
+        border-radius: 12px;
+        padding: .8rem;
+        background: rgba(255, 255, 255, 0.02);
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 
-def init_app_state() -> None:
-    if "active_project_id" not in st.session_state:
-        st.session_state.active_project_id = ""
-    if "state" not in st.session_state:
-        st.session_state.state = None
-    if "paths" not in st.session_state:
-        st.session_state.paths = None
-    if "project_warning" not in st.session_state:
-        st.session_state.project_warning = ""
+def persist(state: dict) -> None:
+    save_session(SESSION_PATH, state)
+    save_results_csv(RESULTS_CSV_PATH, state["labels"], state["listings"])
 
 
-def persist() -> None:
-    state = st.session_state.state
-    paths = st.session_state.paths
-    save_state(paths.state_file, state)
-    save_results(paths.results_csv, state["labels"], state["listings"])
-
-
-def next_unlabeled(state: dict) -> str | None:
-    for item in state["listings"]:
-        if item["listing_id"] not in state["labels"]:
-            return item["listing_id"]
+def next_unlabeled_id(state: dict) -> str | None:
+    for listing in state["listings"]:
+        if listing["listing_id"] not in state["labels"]:
+            return listing["listing_id"]
     return None
 
 
-def get_listing(state: dict, listing_id: str) -> dict:
-    return next(x for x in state["listings"] if x["listing_id"] == listing_id)
+def listing_by_id(state: dict, listing_id: str) -> dict:
+    return next(item for item in state["listings"] if item["listing_id"] == listing_id)
 
 
-def open_project(project_id: str) -> None:
-    paths = project_paths(PROJECTS_DIR / project_id)
-    state, warnings, hard_warning = load_state(paths.state_file, project_id)
-    st.session_state.active_project_id = project_id
-    st.session_state.state = state
-    st.session_state.paths = paths
-    msg = hard_warning or ("; ".join(warnings) if warnings else "")
-    st.session_state.project_warning = msg
+def set_current_listing(state: dict, listing_id: str | None) -> None:
+    state["current_listing_id"] = listing_id
+    persist(state)
 
 
-def create_project_from_zip(uploaded_zip, project_name: str) -> None:
-    project_id = make_project_id()
-    pdir = PROJECTS_DIR / project_id
-    paths = project_paths(pdir)
-    paths.root.mkdir(parents=True, exist_ok=True)
-    paths.logs.mkdir(parents=True, exist_ok=True)
-
-    dataset_root = extract_uploaded_zip(uploaded_zip, paths.extracted)
-    listings, summary, logs = build_listing_index(dataset_root)
-
-    state = {
-        "state_version": 2,
-        "project_id": project_id,
-        "dataset_root": str(dataset_root.resolve()),
-        "listings": [
-            {
-                "listing_id": x.listing_id,
-                "directory": x.directory,
-                "shown_indices": x.shown_indices,
-                "shown_files": x.shown_files,
-            }
-            for x in listings
-        ],
-        "labels": {},
-        "actions": [],
-        "photo_cursor": {},
-        "viewed_indices": {},
-        "current_listing_id": listings[0].listing_id if listings else None,
-        "mode": "labeling",
-    }
-
-    append_logs(paths.logs / "skipped.log", logs)
-
-    summary.source_zip_name = uploaded_zip.name
-    meta = ProjectMetadata(
-        project_id=project_id,
-        project_name=project_name or project_id,
-        source_zip_name=uploaded_zip.name,
-        imported_at=__import__("datetime").datetime.now().isoformat(timespec="seconds"),
-        root_mode=summary.root_mode,
-        total_listing_folders=summary.total_listing_folders,
-        valid_listings=summary.valid_listings,
-        skipped_listings=summary.skipped_listings,
+def apply_label(state: dict, listing_id: str, new_label: int) -> None:
+    previous_label = state["labels"].get(listing_id)
+    state["labels"][listing_id] = new_label
+    state["actions"].append(
+        {
+            "listing_id": listing_id,
+            "previous_label": previous_label,
+            "new_label": new_label,
+        }
     )
 
-    save_metadata(paths.metadata_file, meta)
-    st.session_state.active_project_id = project_id
-    st.session_state.state = state
-    st.session_state.paths = paths
-    st.session_state.project_warning = ""
-    persist()
-
-    st.success(
-        "Импорт завершен: "
-        f"папок={summary.total_listing_folders}, валидных={summary.valid_listings}, пропущено={summary.skipped_listings}"
-    )
-    with st.expander("Почему объявления были пропущены"):
-        st.json(summary.skipped_reasons)
+    state["current_listing_id"] = next_unlabeled_id(state)
+    persist(state)
 
 
-def apply_hotkey_action_if_any() -> None:
-    action = st.query_params.get("hk")
-    if not action or not st.session_state.state:
-        return
+def undo_last_action(state: dict) -> bool:
+    if not state["actions"]:
+        return False
 
-    state = st.session_state.state
-    current_id = state.get("current_listing_id")
-    if not current_id:
-        st.query_params.clear()
-        return
-    listing = get_listing(state, current_id)
+    action = state["actions"].pop()
+    listing_id = action["listing_id"]
+    previous_label = action["previous_label"]
 
-    cursor = state["photo_cursor"].get(current_id, 0)
-    photo_count = len(listing["shown_files"])
+    if previous_label is None:
+        state["labels"].pop(listing_id, None)
+    else:
+        state["labels"][listing_id] = previous_label
 
-    if action == "prev":
-        state["photo_cursor"][current_id] = max(0, cursor - 1)
-    elif action == "next":
-        state["photo_cursor"][current_id] = min(photo_count - 1, cursor + 1)
-    elif action in {"label0", "label1", "label2"}:
-        ready = len(set(state["viewed_indices"].get(current_id, []))) == photo_count
-        if ready:
-            set_label(current_id, int(action[-1]))
-            st.query_params.clear()
-            st.rerun()
-            return
-    elif action == "undo":
-        do_undo()
-        st.query_params.clear()
-        st.rerun()
-        return
+    state["current_listing_id"] = listing_id
+    listing = listing_by_id(state, listing_id)
+    state["photo_cursor"][listing_id] = max(0, len(listing["shown_files"]) - 1)
+    persist(state)
+    return True
 
-    persist()
-    st.query_params.clear()
-    st.rerun()
+
+def init_state() -> dict:
+    if "session_data" not in st.session_state:
+        st.session_state.session_data = load_session(SESSION_PATH)
+    return st.session_state.session_data
 
 
 def inject_hotkeys() -> None:
     components.html(
         """
         <script>
-        const keyToAction = {
-          'ArrowLeft': 'prev',
-          'a': 'prev',
-          'A': 'prev',
-          'ArrowRight': 'next',
-          'd': 'next',
-          'D': 'next',
-          '0': 'label0',
-          '1': 'label1',
-          '2': 'label2',
-          'u': 'undo',
-          'U': 'undo',
-          'Backspace': 'undo'
+        const bindings = {
+            ArrowLeft: '◀ Назад (A/←)',
+            ArrowRight: 'Вперед ▶ (D/→)',
+            a: '◀ Назад (A/←)',
+            d: 'Вперед ▶ (D/→)',
+            0: 'Класс 0 (не нравится)',
+            1: 'Класс 1 (нравится)',
+            2: 'Класс 2 (не определено)',
+            u: '↩ Undo (U/Backspace)',
+            Backspace: '↩ Undo (U/Backspace)'
         };
-        if (!window.__hotkeys_bound) {
-          window.__hotkeys_bound = true;
-          window.addEventListener('keydown', (e) => {
-            const action = keyToAction[e.key];
-            if (!action) return;
-            const url = new URL(window.parent.location.href);
-            url.searchParams.set('hk', action);
-            window.parent.location.href = url.toString();
-            e.preventDefault();
-          });
-        }
+
+        window.addEventListener('keydown', (event) => {
+            const key = event.key;
+            const targetText = bindings[key];
+            if (!targetText) return;
+
+            const buttons = window.parent.document.querySelectorAll('button');
+            for (const btn of buttons) {
+                const text = btn.innerText.trim();
+                if (text === targetText) {
+                    btn.click();
+                    event.preventDefault();
+                    return;
+                }
+            }
+        });
         </script>
         """,
         height=0,
     )
 
 
-def set_label(listing_id: str, label: int) -> None:
-    state = st.session_state.state
-    prev = state["labels"].get(listing_id)
-    state["labels"][listing_id] = label
-    state["actions"].append({"listing_id": listing_id, "previous_label": prev, "new_label": label})
-    state["mode"] = "labeling"
-    state["current_listing_id"] = next_unlabeled(state)
-    persist()
-
-
-def do_undo() -> None:
-    state = st.session_state.state
-    if not state["actions"]:
-        st.warning("Undo недоступен: история пуста.")
+def load_uploaded_dataset(state: dict) -> None:
+    uploaded_zip = st.file_uploader("Загрузите ZIP-архив с объявлениями", type=["zip"])
+    if not uploaded_zip:
         return
-    action = state["actions"].pop()
-    lid = action["listing_id"]
-    if action["previous_label"] is None:
-        state["labels"].pop(lid, None)
-    else:
-        state["labels"][lid] = action["previous_label"]
 
-    state["current_listing_id"] = lid
-    state["mode"] = "edit"
-    listing = get_listing(state, lid)
-    state["photo_cursor"][lid] = len(listing["shown_files"]) - 1
-    state["viewed_indices"][lid] = list(range(len(listing["shown_files"])))
-    persist()
+    if st.button("Импортировать архив", use_container_width=True):
+        dataset_root = extract_uploaded_zip(uploaded_zip, DIRS["uploads"], DIRS["extracted"])
+        listing_objects = build_listing_index(dataset_root, LOG_PATH)
+
+        state["dataset_root"] = str(dataset_root.resolve())
+        state["listings"] = [
+            {
+                "listing_id": item.listing_id,
+                "directory": item.directory,
+                "shown_indices": item.shown_indices,
+                "shown_files": item.shown_files,
+            }
+            for item in listing_objects
+        ]
+        state["labels"] = {}
+        state["actions"] = []
+        state["photo_cursor"] = {}
+        state["current_listing_id"] = next_unlabeled_id(state)
+        persist(state)
+        st.success(f"Импорт завершен: {len(state['listings'])} объявлений доступно для разметки.")
 
 
-def ensure_current_listing() -> None:
-    state = st.session_state.state
+def ensure_current_listing(state: dict) -> None:
     if not state["listings"]:
         state["current_listing_id"] = None
         return
+
     if state["current_listing_id"] is None:
-        state["current_listing_id"] = next_unlabeled(state)
+        state["current_listing_id"] = next_unlabeled_id(state) or state["listings"][0]["listing_id"]
 
 
-def render_project_manager() -> None:
-    st.sidebar.header("Проекты")
-    projects = list_projects(PROJECTS_DIR)
-
-    project_ids = [p.project_id for p in projects]
-    selected = st.sidebar.selectbox("Открыть проект", options=["—"] + project_ids)
-    if selected != "—" and st.sidebar.button("Открыть", use_container_width=True):
-        open_project(selected)
-        st.rerun()
-
-    with st.sidebar.expander("Создать новый проект из ZIP", expanded=not bool(project_ids)):
-        project_name = st.text_input("Название проекта", value="")
-        uploaded_zip = st.file_uploader("ZIP-архив", type=["zip"])
-        if st.button("Импортировать в новый проект", use_container_width=True):
-            if not uploaded_zip:
-                st.error("Сначала выберите ZIP-файл.")
-                return
-            try:
-                create_project_from_zip(uploaded_zip, project_name.strip())
-                st.rerun()
-            except ImportErrorUserFriendly as exc:
-                st.error(str(exc))
-
-
-def render_sidebar_status() -> None:
-    if not st.session_state.state:
-        return
-
-    state = st.session_state.state
+def render_sidebar(state: dict) -> None:
     total = len(state["listings"])
     labeled = len(state["labels"])
-    percent = (labeled / total) if total else 0
+    remaining = max(total - labeled, 0)
+    completion = (labeled / total) if total else 0
+
+    st.sidebar.header("Статус проекта")
+    st.sidebar.progress(completion)
+    st.sidebar.caption(f"Размечено: {labeled} / {total}")
+    st.sidebar.caption(f"Осталось: {remaining}")
+    st.sidebar.caption(f"Готово: {completion * 100:.1f}%")
+
     counts = Counter(state["labels"].values())
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Статус")
-    st.sidebar.progress(percent)
-    st.sidebar.caption(f"Размечено: {labeled}/{total}")
-    st.sidebar.caption(f"Осталось: {max(total-labeled, 0)}")
-    st.sidebar.caption(f"Выполнено: {percent*100:.1f}%")
-    st.sidebar.markdown(f"Класс 0: **{counts.get(0,0)}**  ")
-    st.sidebar.markdown(f"Класс 1: **{counts.get(1,0)}**  ")
-    st.sidebar.markdown(f"Класс 2: **{counts.get(2,0)}**")
-
-    if st.sidebar.button("Undo (U/Backspace)", use_container_width=True):
-        do_undo()
-        st.rerun()
-
-    st.sidebar.download_button(
-        "Скачать results.csv",
-        data=st.session_state.paths.results_csv.read_bytes() if st.session_state.paths.results_csv.exists() else b"",
-        file_name=f"{st.session_state.active_project_id}_results.csv",
-        mime="text/csv",
-        use_container_width=True,
+    st.sidebar.markdown("### Статистика классов")
+    st.sidebar.markdown(
+        f"- Класс **0**: `{counts.get(0, 0)}`\n"
+        f"- Класс **1**: `{counts.get(1, 0)}`\n"
+        f"- Класс **2**: `{counts.get(2, 0)}`"
     )
 
-
-def render_main() -> None:
-    if not st.session_state.state:
-        st.info("Создайте новый проект или откройте существующий в боковой панели.")
-        return
-
-    state = st.session_state.state
-    paths = st.session_state.paths
-
-    if st.session_state.project_warning:
-        st.warning(st.session_state.project_warning)
-
-    meta = (paths.metadata_file.read_text(encoding="utf-8") if paths.metadata_file.exists() else "")
-
-    st.markdown(f"### Текущий проект: `{st.session_state.active_project_id}`")
-    if meta:
-        st.caption(f"Файл метаданных: {paths.metadata_file}")
-
-    ensure_current_listing()
-    current_id = state["current_listing_id"]
-
-    st.markdown("#### Размеченные объявления")
-    rows = listing_table_rows(state)
-    st.dataframe(rows, use_container_width=True, hide_index=True, height=200)
+    if st.sidebar.button("↩ Undo (U/Backspace)", use_container_width=True):
+        if undo_last_action(state):
+            st.sidebar.success("Последнее действие отменено")
+            st.rerun()
+        st.sidebar.warning("История пуста")
 
     labeled_ids = sorted(state["labels"].keys())
-    col_edit1, col_edit2 = st.columns([3, 1])
-    selected = col_edit1.selectbox("Открыть объявление для редактирования", options=["—"] + labeled_ids)
-    if selected != "—" and col_edit2.button("Редактировать", use_container_width=True):
-        state["current_listing_id"] = selected
-        state["mode"] = "edit"
-        listing = get_listing(state, selected)
-        state["viewed_indices"][selected] = list(range(len(listing["shown_files"])))
-        persist()
+    st.sidebar.markdown("### Изменить уже размеченное")
+    selected = st.sidebar.selectbox(
+        "Открыть объявление",
+        options=["—"] + labeled_ids,
+        help="Выберите объявление, чтобы пересмотреть фото и поменять класс",
+    )
+    if selected != "—" and st.sidebar.button("Открыть выбранное", use_container_width=True):
+        set_current_listing(state, selected)
         st.rerun()
 
-    if not current_id:
-        st.success("Все объявления размечены. Можно редактировать ранее сохранённые метки.")
+
+def render_main(state: dict) -> None:
+    if not state["listings"]:
+        st.info("Загрузите ZIP-архив, чтобы начать разметку.")
         return
 
-    listing = get_listing(state, current_id)
-    total_photos = len(listing["shown_files"])
-    cursor = int(state["photo_cursor"].get(current_id, 0))
-    cursor = max(0, min(cursor, total_photos - 1))
+    ensure_current_listing(state)
+    current_id = state["current_listing_id"]
+    if current_id is None:
+        st.success("Все объявления размечены. Можно открыть любое в правой панели для редактирования.")
+        return
+
+    listing = listing_by_id(state, current_id)
+    photo_total = len(listing["shown_files"])
+    cursor = state["photo_cursor"].get(current_id, 0)
+    cursor = max(0, min(cursor, photo_total - 1))
     state["photo_cursor"][current_id] = cursor
-
-    viewed = set(state["viewed_indices"].get(current_id, []))
-    viewed.add(cursor)
-    state["viewed_indices"][current_id] = sorted(viewed)
-
-    is_fully_viewed = len(viewed) == total_photos
-    current_label = state["labels"].get(current_id)
-
-    status_tag = "РАЗМЕЧЕНО" if current_label is not None else "НЕ РАЗМЕЧЕНО"
-    mode_tag = "Режим редактирования" if state.get("mode") == "edit" else "Первичная разметка"
 
     st.markdown(
         f"""
-        <div class='card'>
-          <div><span class='tag'>{mode_tag}</span><span class='tag'>{status_tag}</span></div>
-          <h4>Объявление: <code>{current_id}</code></h4>
-          <div class='muted'>Фото {cursor+1} из {total_photos} | Просмотрено: {len(viewed)}/{total_photos}</div>
-          <div class='muted'>Показываемые индексы: {listing['shown_indices']}</div>
-          <div class='muted'>Текущая метка: {current_label if current_label is not None else 'не задана'}</div>
+        <div class="header-card">
+            <div class="photo-meta">Объявление: <code>{current_id}</code></div>
+            <div>Фото {cursor + 1} из {photo_total}</div>
+            <div class="muted">Показываются только изображения с индексами: {listing['shown_indices']}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -380,45 +249,47 @@ def render_main() -> None:
 
     st.image(listing["shown_files"][cursor], use_container_width=True)
 
-    col1, col2, _ = st.columns([1, 1, 4])
-    if col1.button("◀ Назад", disabled=cursor == 0, use_container_width=True):
-        state["photo_cursor"][current_id] = cursor - 1
-        persist()
-        st.rerun()
-    if col2.button("Вперёд ▶", disabled=cursor >= total_photos - 1, use_container_width=True):
-        state["photo_cursor"][current_id] = cursor + 1
-        persist()
+    nav_col1, nav_col2, _ = st.columns([1, 1, 3])
+    if nav_col1.button("◀ Назад (A/←)", use_container_width=True, disabled=cursor == 0):
+        state["photo_cursor"][current_id] = max(0, cursor - 1)
+        persist(state)
         st.rerun()
 
-    st.caption("Классификация доступна только после просмотра всех показываемых фото этого объявления.")
-    c0, c1, c2 = st.columns(3)
-    if c0.button("Класс 0", disabled=not is_fully_viewed, use_container_width=True):
-        set_label(current_id, 0)
-        st.rerun()
-    if c1.button("Класс 1", disabled=not is_fully_viewed, use_container_width=True):
-        set_label(current_id, 1)
-        st.rerun()
-    if c2.button("Класс 2", disabled=not is_fully_viewed, use_container_width=True):
-        set_label(current_id, 2)
+    if nav_col2.button("Вперед ▶ (D/→)", use_container_width=True, disabled=cursor >= photo_total - 1):
+        state["photo_cursor"][current_id] = min(photo_total - 1, cursor + 1)
+        persist(state)
         st.rerun()
 
-    persist()
+    is_last_photo = cursor >= photo_total - 1
+    st.markdown("### Классификация")
+    st.caption("Кнопки становятся активными после просмотра последнего фото.")
+    class_cols = st.columns(3)
+
+    if class_cols[0].button("Класс 0 (не нравится)", use_container_width=True, disabled=not is_last_photo):
+        apply_label(state, current_id, 0)
+        st.rerun()
+
+    if class_cols[1].button("Класс 1 (нравится)", use_container_width=True, disabled=not is_last_photo):
+        apply_label(state, current_id, 1)
+        st.rerun()
+
+    if class_cols[2].button("Класс 2 (не определено)", use_container_width=True, disabled=not is_last_photo):
+        apply_label(state, current_id, 2)
+        st.rerun()
 
 
 def main() -> None:
     st.title("🏡 Разметка фотографий объявлений недвижимости")
-    st.caption("Горячие клавиши: ←/→ или A/D, 0/1/2, U или Backspace")
+    st.caption("Горячие клавиши: ←/→ или A/D, 0/1/2 для класса, U или Backspace для Undo")
 
-    init_app_state()
+    state = init_state()
     inject_hotkeys()
-    render_project_manager()
 
-    if st.session_state.active_project_id and st.session_state.state is None:
-        open_project(st.session_state.active_project_id)
+    with st.expander("Импорт данных", expanded=not bool(state["listings"])):
+        load_uploaded_dataset(state)
 
-    apply_hotkey_action_if_any()
-    render_sidebar_status()
-    render_main()
+    render_sidebar(state)
+    render_main(state)
 
 
 if __name__ == "__main__":
