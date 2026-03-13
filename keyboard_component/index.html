@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <script src="https://unpkg.com/streamlit-component-lib@1.4.0/dist/index.js"></script>
+    <script>
+      const ACTION_BY_KEY = {
+        ArrowLeft: "prev",
+        a: "prev",
+        A: "prev",
+        ArrowRight: "next",
+        d: "next",
+        D: "next",
+        0: "label0",
+        1: "label1",
+        2: "label2",
+        u: "undo",
+        U: "undo",
+        Backspace: "undo",
+      };
+
+      function onRender(event) {
+        const data = event.detail.args || {};
+        const enabled = data.enabled !== false;
+
+        if (window.__kb_handler) {
+          window.removeEventListener("keydown", window.__kb_handler);
+        }
+
+        window.__kb_handler = (e) => {
+          if (!enabled) return;
+          const tag = (e.target && e.target.tagName ? e.target.tagName.toLowerCase() : "");
+          if (["input", "textarea", "select"].includes(tag)) return;
+
+          const action = ACTION_BY_KEY[e.key];
+          if (!action) return;
+
+          Streamlit.setComponentValue({ action, ts: Date.now() });
+          e.preventDefault();
+        };
+
+        window.addEventListener("keydown", window.__kb_handler);
+        Streamlit.setFrameHeight(0);
+      }
+
+      Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, onRender);
+      Streamlit.setComponentReady();
+      Streamlit.setFrameHeight(0);
+    </script>
+  </head>
+  <body></body>
+</html>
