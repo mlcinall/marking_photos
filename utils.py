@@ -17,6 +17,7 @@ class ListingData:
     directory: str
     shown_indices: list[int]
     shown_files: list[str]
+    shown_previews: list[str]
 
 
 @dataclass
@@ -68,7 +69,6 @@ def extract_uploaded_zip(uploaded_file, project_extracted_dir: Path) -> Path:
     root_entries = list(project_extracted_dir.iterdir())
     dir_entries = [p for p in root_entries if p.is_dir()]
 
-    # archive/<listing_id>/* or archive/<root>/<listing_id>/*
     if len(dir_entries) == 1:
         candidate_root = dir_entries[0]
         child_dirs = [p for p in candidate_root.iterdir() if p.is_dir()]
@@ -87,7 +87,20 @@ def _is_image_readable(path: Path) -> bool:
         return False
 
 
-def build_listing_index(dataset_root: Path) -> tuple[list[ListingData], ImportSummary, list[str]]:
+def _ensure_preview(image_path: Path, preview_path: Path, max_side: int = 1600) -> str:
+    if preview_path.exists():
+        return str(preview_path)
+
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(image_path) as img:
+        # Fast lightweight preview for annotation workflow.
+        img = img.convert("RGB")
+        img.thumbnail((max_side, max_side))
+        img.save(preview_path, format="JPEG", quality=82, optimize=True)
+    return str(preview_path)
+
+
+def build_listing_index(dataset_root: Path, preview_root: Path) -> tuple[list[ListingData], ImportSummary, list[str]]:
     listings: list[ListingData] = []
     logs: list[str] = []
 
@@ -113,12 +126,15 @@ def build_listing_index(dataset_root: Path) -> tuple[list[ListingData], ImportSu
 
         shown_indices: list[int] = []
         shown_files: list[str] = []
+        shown_previews: list[str] = []
         for idx, image_path in enumerate(image_files):
             if idx % 2 != 0:
                 continue
             if _is_image_readable(image_path):
                 shown_indices.append(idx)
                 shown_files.append(str(image_path.resolve()))
+                preview_file = preview_root / folder.name / f"{idx:04d}.jpg"
+                shown_previews.append(_ensure_preview(image_path, preview_file))
             else:
                 logs.append(f"[{folder.name}] corrupted image skipped: {image_path.name} (index={idx})")
 
@@ -133,6 +149,7 @@ def build_listing_index(dataset_root: Path) -> tuple[list[ListingData], ImportSu
                 directory=str(folder.resolve()),
                 shown_indices=shown_indices,
                 shown_files=shown_files,
+                shown_previews=shown_previews,
             )
         )
 

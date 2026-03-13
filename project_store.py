@@ -146,6 +146,8 @@ def validate_state(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         if not expected.issubset(set(listing.keys())):
             warnings.append(f"Listing entry skipped due to missing fields: {listing}")
             continue
+        if "shown_previews" not in listing or not isinstance(listing.get("shown_previews"), list):
+            listing["shown_previews"] = list(listing["shown_files"])
         cleaned_listings.append(listing)
     state["listings"] = cleaned_listings
 
